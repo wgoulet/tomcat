@@ -16,18 +16,42 @@
  */
 package org.apache.tomcat.util.net;
 
+import com.google.gson.Gson;
+import org.jdt.TDObject;
+import java.security.cert.Certificate;
+import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.HttpURLConnection;
+import org.apache.http.StatusLine;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpClient;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.client.methods.HttpPost;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLEngineResult.Status;
+import org.apache.http.Header;
+import org.apache.http.HttpHost;
+import org.apache.http.HttpRequest;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.conn.ClientConnectionManager;
+import org.apache.http.params.HttpParams;
+import org.apache.http.protocol.HttpContext;
 
 /**
  *
@@ -151,6 +175,11 @@ public class SecureNioChannel extends NioChannel  {
      */
     @Override
     public int handshake(boolean read, boolean write) throws IOException {
+	    try {
+					Files.write(Paths.get("/home/wgoulet/tlog"), "SSL connection handled by SecNioChannel\n".getBytes(), StandardOpenOption.APPEND);
+				} catch (Exception e) {
+					throw e;				
+				}
         if ( handshakeComplete ) return 0; //we have done our initial handshake
 
         if (!flush(netOutBuffer)) return SelectionKey.OP_WRITE; //we still have data to write
@@ -166,6 +195,14 @@ public class SecureNioChannel extends NioChannel  {
                 case FINISHED: {
                     //we are complete if we have delivered the last package
                     handshakeComplete = !netOutBuffer.hasRemaining();
+		    try{
+			    submitTelemetryData(sslEngine.getSession());
+		    }
+		    catch(Exception e)
+		    {
+			    throw new IOException("Failure");
+		    }
+
                     //return 0 if we are complete, otherwise we still have data to write
                     return handshakeComplete?0:SelectionKey.OP_WRITE;
                 }
@@ -196,10 +233,6 @@ public class SecureNioChannel extends NioChannel  {
                     } else if ( handshake.getStatus() == Status.BUFFER_UNDERFLOW ){
                         //read more data, reregister for OP_READ
                         return SelectionKey.OP_READ;
-                    } else if (handshake.getStatus() == Status.BUFFER_OVERFLOW) {
-                        // TODO AJP and HTTPS have different expectations for the state of
-                        // the buffer at the start of a read. These need to be reconciled.
-                        bufHandler.getReadBuffer().compact();
                     } else {
                         throw new IOException(sm.getString("channel.nio.ssl.unexpectedStatusDuringWrap", handshakeStatus));
                     }//switch
@@ -214,8 +247,51 @@ public class SecureNioChannel extends NioChannel  {
         }//while
         //return 0 if we are complete, otherwise reregister for any activity that
         //would cause this method to be called again.
+	
         return handshakeComplete?0:(SelectionKey.OP_WRITE|SelectionKey.OP_READ);
     }
+
+	void submitTelemetryData(SSLSession se) throws Exception {
+		try {
+			// Submit session to TLSTelemetry Server
+			Files.write(Paths.get("/home/wgoulet/tlog"), "Preparing to submit telemetric data\n".getBytes(), StandardOpenOption.APPEND);
+			Gson gson = new Gson();
+			Files.write(Paths.get("/home/wgoulet/tlog"), "Created serializer\n".getBytes(), StandardOpenOption.APPEND);
+			TDObject td = new TDObject();
+			td.setCipher(se.getCipherSuite());
+                        for(Certificate c : se.getLocalCertificates())
+                        {
+                            td.addCert(c.getEncoded());
+                        }
+			td.setProtocol(se.getProtocol());
+			String tdstr = gson.toJson(td);
+			Files.write(Paths.get("/home/wgoulet/tlog"), tdstr.getBytes(), StandardOpenOption.APPEND);
+
+			
+			CloseableHttpClient httpClient = HttpClients.createDefault();
+
+			HttpPost pst = new HttpPost("http://localhost:8084/TLSTelemetryServer/webresources/tde");
+			pst.addHeader("content-type", "application/json; charset=utf-8");
+			StringEntity ent = new StringEntity(tdstr);
+			ent.setContentType("application/json");
+			pst.setEntity(ent);
+			HttpResponse rsp = httpClient.execute(pst);
+			
+			
+
+			Files.write(Paths.get("/home/wgoulet/tlog"), "Generated telemetric data header\n".getBytes(), StandardOpenOption.APPEND);
+			
+			StatusLine sl = rsp.getStatusLine();
+			int rp = sl.getStatusCode();
+			if (rp == 201) {
+				Files.write(Paths.get("/home/wgoulet/tlog"), "Submitted telemetric data\n".getBytes(), StandardOpenOption.APPEND);
+			} else {
+				Files.write(Paths.get("/home/wgoulet/tlog"), "Failed to submit SSL Context\n".getBytes(), StandardOpenOption.APPEND);
+			}
+		} catch (Exception ex) {
+			throw ex;
+		}
+	}
 
     /**
      * Force a blocking handshake to take place for this key.
@@ -247,7 +323,12 @@ public class SecureNioChannel extends NioChannel  {
                     default : {
                         long now = System.currentTimeMillis();
                         if (selector==null) {
-                            selector = Selector.open();
+                            synchronized (Selector.class) {
+                                // Selector.open() isn't thread safe
+                                // http://bugs.sun.com/view_bug.do?bug_id=6427854
+                                // Affects 1.6.0_29, fixed in 1.7.0_01
+                                selector = Selector.open();
+                            }
                             key = getIOChannel().register(selector, hsStatus);
                         } else {
                             key.interestOps(hsStatus); // null warning supressed
@@ -568,4 +649,5 @@ public class SecureNioChannel extends NioChannel  {
         return sc;
     }
 
+    
 }
